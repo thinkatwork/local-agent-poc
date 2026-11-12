@@ -55,24 +55,6 @@ Web search uses [Tavily](https://tavily.com). Page reading runs on your Mac and 
 
 If your Mac has limited free memory, try `ollama pull qwen3:4b` and enter `qwen3:4b` in the model field.
 
-## Publish this project to GitHub
-
-1. Sign in to GitHub and create a **new empty repository** named `local-agent-poc`. Choose **Private** while you are experimenting. Do not ask GitHub to add a README, `.gitignore`, or license; those files are already in this project.
-2. On your Mac, open Terminal and go to this project folder. One easy way is to type `cd ` (including the space), drag the `local-agent-poc` folder from Finder into Terminal, then press Return.
-3. Run these commands, replacing `YOUR-GITHUB-USERNAME` with your GitHub username:
-
-   ```bash
-   git init -b main
-   git add .
-   git commit -m "Initial local document agent POC"
-   git remote add origin https://github.com/YOUR-GITHUB-USERNAME/local-agent-poc.git
-   git push -u origin main
-   ```
-
-4. If GitHub asks you to authenticate, complete its sign-in prompt. When the push finishes, refresh the repository page.
-
-The `.gitignore` excludes your virtual environment, temporary Python files, and documents added to `documents/`; the fictional `example-handbook.md` remains included. Keep personal or work documents out of GitHub. This project has no license file; decide on a license before making the repository public if you want others to reuse the code.
-
 ## What the agent does
 
 The model receives the conversation and the function descriptions. It may request `list_documents` to see filenames, `search_documents` to find relevant passages, and `read_document` to inspect one matching file. With web research enabled it may also call `web_search` (Tavily, up to 5 results with title, URL, snippet and date where available) and `fetch_page` (downloads one public page and extracts its title, date and main text). Python validates every request and performs the read-only operation. The returned text goes back to the model, which drafts the answer and cites source filenames, or web page titles, URLs and dates. The app also appends a **Sources** list built from the pages the tools actually read.
