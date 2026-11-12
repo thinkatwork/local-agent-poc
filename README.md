@@ -21,7 +21,7 @@ A small local AI agent with a browser-based chat UI. It uses Ollama for inferenc
 3. In Terminal, enter the folder containing this repo and run:
 
    ```bash
-   cd local-agent-poc
+   cd research_agent
    python3 -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
