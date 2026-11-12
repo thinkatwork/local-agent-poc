@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .env
+.env.*
+!.env.example
 /documents/*
 !/documents/.gitkeep
 !/documents/example-handbook.md
+.agents/
+.claude/

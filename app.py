@@ -8,14 +8,20 @@ from urllib.request import urlopen
 
 import streamlit as st
 
-from agent.core import run_agent
+from agent.config import tavily_api_key
+from agent.core import MAX_PAGES_PER_QUESTION, MAX_SEARCHES_PER_QUESTION, run_agent
 
 APP_ROOT = Path(__file__).resolve().parent
 DEFAULT_DOCS = os.environ.get("AGENT_DOCS_DIR", str(APP_ROOT / "documents"))
 
-st.set_page_config(page_title="Local Document Agent", page_icon="🗂️", layout="centered")
-st.title("Local Document Agent")
-st.caption("Ask questions about files in a folder on this Mac. The agent can search and read; it cannot edit files or run commands.")
+TAVILY_API_KEY = tavily_api_key()
+
+st.set_page_config(page_title="Local Research Assistant", page_icon="🔎", layout="centered")
+st.title("Local Research Assistant")
+st.caption(
+    "Ask about files in a folder on this Mac, or research the public web. "
+    "The assistant is read-only: it can search and read, but cannot edit files, run commands, sign in, submit forms or post."
+)
 
 with st.sidebar:
     st.header("Settings")
@@ -32,6 +38,24 @@ with st.sidebar:
     except (URLError, TimeoutError, OSError):
         st.error("Ollama is not responding. Open the Ollama app first.")
 
+    st.subheader("Web research")
+    if TAVILY_API_KEY:
+        st.caption("Tavily search API key loaded from `.env`.")
+    else:
+        st.warning("No `TAVILY_API_KEY` found. Copy `.env.example` to `.env`, add your key, then restart the app.")
+    web_enabled = st.toggle(
+        "Allow web search and page reading",
+        value=st.session_state.get("web_enabled", bool(TAVILY_API_KEY)) and bool(TAVILY_API_KEY),
+        disabled=not TAVILY_API_KEY,
+    )
+    st.session_state.web_enabled = bool(web_enabled and TAVILY_API_KEY)
+    st.caption(
+        f"Per question: up to {MAX_SEARCHES_PER_QUESTION} searches and {MAX_PAGES_PER_QUESTION} pages. "
+        "Public http/https pages only; local and private-network addresses are blocked. "
+        "Search queries are sent to Tavily; each search uses 1 credit."
+    )
+
+    st.subheader("Local documents")
     st.markdown("**Supported files:** `.txt`, `.md`, `.pdf` (text-based PDFs)")
     uploads = st.file_uploader(
         "Add documents to this folder",
@@ -76,19 +100,22 @@ for item in st.session_state.display_messages:
                     st.markdown(f"**{tool['name']}** · `{tool['arguments']}`")
                     st.code(tool["result"][:2500], language="text")
 
-prompt = st.chat_input("Ask about the documents in your folder")
+prompt = st.chat_input("Ask about your documents or research the web")
 if prompt:
     st.session_state.display_messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
     with st.chat_message("assistant"):
-        with st.spinner("Searching your local documents…"):
+        spinner_text = "Researching your documents and the web…" if st.session_state.web_enabled else "Searching your local documents…"
+        with st.spinner(spinner_text):
             try:
                 answer, api_messages, trace = run_agent(
                     question=prompt,
                     model=st.session_state.model,
                     docs_dir=st.session_state.docs_path,
                     messages=st.session_state.api_messages,
+                    web_enabled=st.session_state.web_enabled,
+                    api_key=TAVILY_API_KEY,
                 )
                 st.session_state.api_messages = api_messages
                 st.markdown(answer)
