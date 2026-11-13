@@ -10,11 +10,13 @@ Model calls per question:
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import urlsplit
 
 from .core import format_sources
+from .jobs import Cancelled, check_cancel
 from .providers.models import ModelProvider, ModelResult, ProviderError
 from .providers.search import SearchProvider, SearchQuotaError
 from .web import MAX_QUERY_CHARS, fetch_page
@@ -152,6 +154,7 @@ class ResearchResult:
     trace: list[dict[str, str]]
     usage: dict
     stopped: str | None = None
+    cancelled: bool = False
 
 
 def _clip(text: str, limit: int) -> str:
@@ -193,7 +196,10 @@ def run_research(
     history: list[dict[str, str]] | None = None,
     fetcher: Callable[[str], tuple[str, dict[str, str] | None]] = fetch_page,
     today: str | None = None,
+    cancel: threading.Event | None = None,
+    on_step: Callable[[str], None] | None = None,
 ) -> ResearchResult:
+    """Run the bounded workflow. Setting `cancel` stops it before the next search, fetch or model call."""
     from datetime import date
 
     today = today or date.today().isoformat()
@@ -202,6 +208,7 @@ def run_research(
     pages_read: list[dict[str, str]] = []
     search_hits: list[dict[str, str]] = []
     stopped: str | None = None
+    cancelled = False
     per_call = limits.max_input_chars
 
     previous = ""
@@ -209,7 +216,20 @@ def run_research(
         last = history[-1]
         previous = _clip(f"Previous question: {last['question']}\nPrevious answer: {last['answer']}", 1_500)
 
+    def checkpoint(label: str) -> None:
+        check_cancel(cancel)
+        if on_step is not None:
+            on_step(label)
+
+    step_labels = {
+        "planner": "Planning searches",
+        "researcher": "Researcher: writing evidence notes",
+        "reviewer": "Reviewer: checking the notes",
+        "writer": "Writer: drafting the answer",
+    }
+
     def call(step: str, system: str, prompt: str) -> str:
+        checkpoint(f"{step_labels.get(step, step)} ({model.name})")
         prompt = _clip(prompt, per_call)
         budget.before_model_call(len(system) + len(prompt))
         result = model.generate(system, prompt, limits.max_output_tokens)
@@ -219,7 +239,9 @@ def run_research(
         return result.text
 
     def finish(answer: str) -> ResearchResult:
-        return ResearchResult(answer + format_sources(pages_read, search_hits), trace, budget.usage.as_dict(), stopped)
+        return ResearchResult(
+            answer + format_sources(pages_read, search_hits), trace, budget.usage.as_dict(), stopped, cancelled
+        )
 
     calls_needed = 2 + (1 if review else 0)
     try:
@@ -235,7 +257,8 @@ def run_research(
             queries = [line[:MAX_QUERY_CHARS] for line in lines if line][: limits.max_searches] or queries
 
         # 2. Search (Python enforces the limit).
-        for query in queries:
+        for number, query in enumerate(queries, 1):
+            checkpoint(f"Searching the web ({number}/{len(queries)})")
             try:
                 budget.take_search()
             except BudgetExceeded:
@@ -255,7 +278,9 @@ def run_research(
 
         # 3. Fetch selected pages directly (read-only GET, URL-checked).
         page_texts: list[str] = []
-        for hit in select_pages(search_hits, limits.max_fetches):
+        chosen = select_pages(search_hits, limits.max_fetches)
+        for number, hit in enumerate(chosen, 1):
+            checkpoint(f"Reading page {number}/{len(chosen)}: {_domain(hit['url'])}")
             try:
                 budget.take_fetch()
             except BudgetExceeded:
@@ -306,8 +331,14 @@ def run_research(
         stopped = f"Stopped: {exc}."
     except ProviderError as exc:
         stopped = f"Stopped: {exc}"
+    except Cancelled:
+        cancelled = True
+        stopped = "Cancelled by you."
     partial = next((t["result"] for t in reversed(trace) if t["name"].startswith("researcher")), "")
-    body = f"**{stopped}** Nothing was retried."
+    if cancelled:
+        body = "**Cancelled by you.** No further searches, page fetches or model calls were made."
+    else:
+        body = f"**{stopped}** Nothing was retried."
     if partial:
         body += "\n\nResearcher notes gathered before stopping (not reviewed):\n\n" + partial
     return finish(body)

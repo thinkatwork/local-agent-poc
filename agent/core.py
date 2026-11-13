@@ -5,12 +5,14 @@ and public page fetching with hard per-question limits.
 """
 from __future__ import annotations
 
+import threading
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 from ollama import ChatResponse, chat
 
 from .documents import list_documents as find_documents
+from .jobs import check_cancel
 from .documents import read_document as load_document
 from .documents import search_documents as search_local_documents
 from .web import fetch_page as fetch_public_page
@@ -83,8 +85,18 @@ def run_agent(
     messages: list[Any] | None = None,
     web_enabled: bool = False,
     api_key: str | None = None,
+    cancel: threading.Event | None = None,
+    on_step: Callable[[str], None] | None = None,
 ) -> tuple[str, list[Any], list[dict[str, str]]]:
-    """Run one user turn, returning answer, API conversation, and tool trace."""
+    """Run one user turn, returning answer, API conversation, and tool trace.
+
+    Setting `cancel` raises `Cancelled` before the next model call or tool call.
+    """
+
+    def checkpoint(label: str) -> None:
+        check_cancel(cancel)
+        if on_step is not None:
+            on_step(label)
     web_enabled = bool(web_enabled and api_key)
     conversation: list[Any] = list(messages or [])
     prompt = {"role": "system", "content": system_prompt(web_enabled)}
@@ -155,7 +167,8 @@ def run_agent(
     tools = list(available.values())
 
     answer = ""
-    for _ in range(MAX_TOOL_ROUNDS):
+    for round_number in range(1, MAX_TOOL_ROUNDS + 1):
+        checkpoint(f"Model is reading and planning (round {round_number}/{MAX_TOOL_ROUNDS})")
         response: ChatResponse = chat(
             model=model,
             messages=conversation,
@@ -163,6 +176,7 @@ def run_agent(
             think=False,
             options={"temperature": 0},
         )
+        check_cancel(cancel)
         conversation.append(response.message)
         calls = response.message.tool_calls or []
         if not calls:
@@ -172,6 +186,7 @@ def run_agent(
         for call in calls:
             name = call.function.name
             args = dict(call.function.arguments or {})
+            checkpoint(f"Running tool: {name}")
             function = available.get(name)
             if function is None:
                 result = "Tool not available."
@@ -184,6 +199,7 @@ def run_agent(
             conversation.append({"role": "tool", "tool_name": name, "content": result})
     else:
         # Ask for a final response (no tools) after the bounded tool loop.
+        checkpoint("Model is writing the final answer")
         conversation.append(
             {"role": "user", "content": "Tool limit reached. Answer now using only the information gathered above, with citations."}
         )

@@ -6,8 +6,11 @@ Neither provider retries a failed request, and errors never include API keys.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from ..jobs import check_cancel
 
 
 class ProviderError(Exception):
@@ -36,35 +39,60 @@ class ModelProvider(Protocol):
 
 
 class OllamaProvider:
-    """Local inference through the Ollama service on this Mac."""
+    """Local inference through the Ollama service on this Mac.
+
+    Replies are streamed so a cancel can stop generation part-way: closing the
+    stream drops the HTTP connection and Ollama stops generating.
+    """
 
     name = "ollama"
     is_cloud = False
 
-    def __init__(self, model: str, chat_fn: Any = None):
+    def __init__(self, model: str, chat_fn: Any = None, cancel: threading.Event | None = None):
         self.model = model
         if chat_fn is None:
             from ollama import chat as chat_fn
         self._chat = chat_fn
+        self._cancel = cancel
+
+    def _failed(self, exc: Exception) -> ProviderError:
+        return ProviderError(
+            f"Ollama request failed ({type(exc).__name__}). Check that Ollama is running and "
+            f"`{self.model}` is installed (`ollama pull {self.model}`)."
+        )
 
     def generate(self, system: str, prompt: str, max_output_tokens: int) -> ModelResult:
+        check_cancel(self._cancel)
         try:
-            response = self._chat(
+            stream = self._chat(
                 model=self.model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
                 think=False,
+                stream=True,
                 options={"temperature": 0, "num_predict": max_output_tokens},
             )
         except Exception as exc:
-            raise ProviderError(
-                f"Ollama request failed ({type(exc).__name__}). Check that Ollama is running and "
-                f"`{self.model}` is installed (`ollama pull {self.model}`)."
-            ) from None
+            raise self._failed(exc) from None
+        parts: list[str] = []
+        last = None
+        try:
+            for chunk in stream:
+                if self._cancel is not None and self._cancel.is_set():
+                    break
+                parts.append(chunk.message.content or "")
+                last = chunk
+        except Exception as exc:
+            raise self._failed(exc) from None
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+        check_cancel(self._cancel)
         return ModelResult(
-            text=(response.message.content or "").strip(),
-            input_tokens=getattr(response, "prompt_eval_count", None),
-            output_tokens=getattr(response, "eval_count", None),
-            truncated=getattr(response, "done_reason", None) == "length",
+            text="".join(parts).strip(),
+            input_tokens=getattr(last, "prompt_eval_count", None),
+            output_tokens=getattr(last, "eval_count", None),
+            truncated=getattr(last, "done_reason", None) == "length",
         )
 
 

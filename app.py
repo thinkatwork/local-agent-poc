@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -10,6 +11,7 @@ import streamlit as st
 
 from agent.config import load_settings, redact, secrets
 from agent.core import run_agent
+from agent.jobs import BackgroundJob, Cancelled, start_job
 from agent.providers import GeminiProvider, OllamaProvider, TavilySearch
 from agent.workflow import Limits, Pricing, run_research
 
@@ -27,6 +29,7 @@ LIMITS = Limits(
 )
 PROVIDER_LABELS = {"ollama": "Ollama (local, on this Mac)", "gemini": "Gemini (Google cloud)"}
 MODE_WEB, MODE_DOCS = "Web research", "Local documents"
+CANCEL_GRACE_SECONDS = 3  # how long the UI waits for a cancelled question to wind down before moving on
 
 st.set_page_config(page_title="Research Assistant", page_icon="🔎", layout="centered")
 st.title("Research Assistant")
@@ -147,6 +150,9 @@ with st.sidebar:
             st.rerun()
 
     if st.button("Clear conversation", use_container_width=True):
+        if st.session_state.get("active"):
+            st.session_state.active["job"].cancel.set()
+            st.session_state.active = None
         st.session_state.api_messages = []
         st.session_state.display_messages = []
         st.session_state.research_history = []
@@ -181,68 +187,145 @@ elif mode == MODE_WEB:
     st.info("Ollama mode: the model runs on this Mac. Search queries still go to Tavily and pages are fetched from the web.")
 
 ready = provider_ready and mode_ready
+active = st.session_state.get("active")
 prompt = st.chat_input(
     "Ask a research question" if mode == MODE_WEB else "Ask about your documents",
-    disabled=not ready,
+    disabled=not ready or active is not None,
 )
-if prompt:
-    st.session_state.display_messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    with st.chat_message("assistant"):
-        try:
-            if mode == MODE_DOCS:
-                with st.spinner("Searching your local documents…"):
-                    answer, api_messages, trace = run_agent(
-                        question=prompt,
-                        model=SETTINGS.ollama_model,
-                        docs_dir=st.session_state.docs_path,
-                        messages=st.session_state.api_messages,
-                        web_enabled=False,
-                    )
-                st.session_state.api_messages = api_messages
-                st.markdown(answer)
-                if trace:
-                    show_trace(trace)
-                st.session_state.display_messages.append({"role": "assistant", "content": answer, "tools": trace})
-            else:
-                if provider == "gemini":
-                    model = GeminiProvider(
-                        SETTINGS.gemini_api_key or "",
-                        SETTINGS.gemini_model,
-                        timeout_seconds=SETTINGS.request_timeout_seconds,
-                        tier=SETTINGS.gemini_tier,
-                    )
-                else:
-                    model = OllamaProvider(SETTINGS.ollama_model)
-                pricing = Pricing(
-                    SETTINGS.gemini_input_price_per_m,
-                    SETTINGS.gemini_output_price_per_m,
-                    SETTINGS.max_estimated_spend_per_question,
-                )
-                with st.spinner("Researching: search → read pages → notes → review → answer…"):
-                    result = run_research(
-                        question=prompt,
-                        model=model,
-                        search=TavilySearch(SETTINGS.tavily_api_key or ""),
-                        limits=LIMITS,
-                        pricing=pricing,
-                        review=st.session_state.review,
-                        history=st.session_state.research_history,
-                    )
-                answer = redact(result.answer, SECRETS)
-                st.markdown(answer)
-                show_trace(result.trace)
-                show_usage(result.usage, provider)
-                st.session_state.research_history.append({"question": prompt, "answer": answer})
-                st.session_state.display_messages.append(
-                    {"role": "assistant", "content": answer, "tools": result.trace, "usage": result.usage, "provider": provider}
-                )
-        except Exception as exc:
-            message = redact(
-                f"The request failed and was not retried.\n\nDetails: `{type(exc).__name__}: {str(exc)[:300]}`", SECRETS
+
+
+def make_work(question: str, question_mode: str, question_provider: str):
+    """Build the function the background thread runs. It must not call Streamlit."""
+    docs_dir = st.session_state.docs_path
+    api_messages = list(st.session_state.api_messages)
+    history = list(st.session_state.research_history)
+    review = st.session_state.review
+
+    def work(cancel, report):
+        if question_mode == MODE_DOCS:
+            return run_agent(
+                question=question,
+                model=SETTINGS.ollama_model,
+                docs_dir=docs_dir,
+                messages=api_messages,
+                web_enabled=False,
+                cancel=cancel,
+                on_step=report,
             )
-            if provider == "ollama":
-                message += f"\n\nCheck that Ollama is running and `{SETTINGS.ollama_model}` is installed."
-            st.error(message)
-            st.session_state.display_messages.append({"role": "assistant", "content": message})
+        if question_provider == "gemini":
+            model = GeminiProvider(
+                SETTINGS.gemini_api_key or "",
+                SETTINGS.gemini_model,
+                timeout_seconds=SETTINGS.request_timeout_seconds,
+                tier=SETTINGS.gemini_tier,
+            )
+        else:
+            model = OllamaProvider(SETTINGS.ollama_model, cancel=cancel)
+        pricing = Pricing(
+            SETTINGS.gemini_input_price_per_m,
+            SETTINGS.gemini_output_price_per_m,
+            SETTINGS.max_estimated_spend_per_question,
+        )
+        return run_research(
+            question=question,
+            model=model,
+            search=TavilySearch(SETTINGS.tavily_api_key or ""),
+            limits=LIMITS,
+            pricing=pricing,
+            review=review,
+            history=history,
+            cancel=cancel,
+            on_step=report,
+        )
+
+    return work
+
+
+def cancel_active() -> None:
+    if st.session_state.get("active"):
+        st.session_state.active["job"].cancel.set()
+
+
+def finish_active(item: dict) -> None:
+    """Turn a finished (or abandoned) background job into a chat message."""
+    job: BackgroundJob = item["job"]
+    question, question_mode, question_provider = item["question"], item["mode"], item["provider"]
+    messages = st.session_state.display_messages
+    if not job.done:
+        # Cancelled, but a request already in flight has not returned yet. Abandon it: the thread
+        # stops at its next check, starts nothing new, and its result is discarded.
+        if question_mode == MODE_DOCS:
+            note = (
+                "No further model or document tool calls will be made. The local model may finish its current "
+                "reply in the background on this Mac; the result is discarded."
+            )
+        else:
+            note = "No further searches, page fetches or model calls will be made."
+        if question_provider == "gemini" and question_mode == MODE_WEB:
+            note += (
+                " A Gemini request that was already in progress cannot be recalled: it may still finish at Google "
+                "and be billed, and its result will be discarded."
+            )
+        messages.append({"role": "assistant", "content": f"**Cancelled by you.** {note}"})
+    elif isinstance(job.error, Cancelled):
+        messages.append(
+            {"role": "assistant", "content": "**Cancelled by you.** No further model calls or tool calls were made."}
+        )
+    elif job.error is not None:
+        exc = job.error
+        message = redact(
+            f"The request failed and was not retried.\n\nDetails: `{type(exc).__name__}: {str(exc)[:300]}`", SECRETS
+        )
+        if question_provider == "ollama" or question_mode == MODE_DOCS:
+            message += f"\n\nCheck that Ollama is running and `{SETTINGS.ollama_model}` is installed."
+        messages.append({"role": "assistant", "content": message})
+    elif question_mode == MODE_DOCS:
+        answer, api_messages, trace = job.result
+        st.session_state.api_messages = api_messages
+        messages.append({"role": "assistant", "content": redact(answer, SECRETS), "tools": trace})
+    else:
+        result = job.result
+        answer = redact(result.answer, SECRETS)
+        if not result.cancelled:
+            st.session_state.research_history.append({"question": question, "answer": answer})
+        messages.append(
+            {"role": "assistant", "content": answer, "tools": result.trace, "usage": result.usage, "provider": question_provider}
+        )
+    st.session_state.active = None
+
+
+if prompt and active is None:
+    st.session_state.display_messages.append({"role": "user", "content": prompt})
+    st.session_state.active = {
+        "job": start_job(make_work(prompt, mode, provider)),
+        "question": prompt,
+        "mode": mode,
+        "provider": provider,
+    }
+    st.rerun()
+
+if active is not None:
+    job: BackgroundJob = active["job"]
+    with st.chat_message("assistant"):
+        status = st.empty()
+        st.button(
+            "Cancelling…" if job.cancelled else "Cancel",
+            on_click=cancel_active,
+            disabled=job.cancelled,
+            key="cancel_active_question",
+            icon=":material/stop_circle:",
+            help="Stop this question. Nothing new is searched, fetched or sent to the model after you cancel.",
+        )
+        cancel_deadline = None
+        while not job.done:
+            elapsed = int(time.monotonic() - job.started)
+            if job.cancelled:
+                cancel_deadline = cancel_deadline or time.monotonic() + CANCEL_GRACE_SECONDS
+                if time.monotonic() > cancel_deadline:
+                    break
+                status.warning("Cancelling: waiting for the current step to stop…")
+            else:
+                status.info(f"{job.step}… ({elapsed}s)")
+            time.sleep(0.25)
+    finish_active(active)
+    st.rerun()
