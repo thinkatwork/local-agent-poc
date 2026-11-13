@@ -7,6 +7,8 @@ documents are never read here, so they are never sent to a cloud model.
 Model calls per question:
   researcher (1) + reviewer (1, optional) + writer (1)
   + query planning (1) only when MAX_MODEL_CALLS_PER_QUESTION leaves room for it.
+After the writer, Python checks each cited quote against the fetched page text
+(see citations.py); that step makes no model call or network request.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import urlsplit
 
+from .citations import check_citations, summarize
 from .core import format_sources
 from .jobs import Cancelled, check_cancel
 from .providers.models import ModelProvider, ModelResult, ProviderError
@@ -35,7 +38,8 @@ Each query should target a different aspect of the question. Today's date is {{t
 
 RESEARCHER_PROMPT = f"""You are the researcher step of a read-only research workflow.
 From the sources provided, write short evidence notes that answer the user's question.
-Each note: one factual claim, then the source in the form [Title | URL | date or "date not stated"].
+Each note: one factual claim, then the source in the form [Title | URL | date or "date not stated" | "quote"],
+where quote is 6 to 25 words copied exactly, character for character, from that source's text and supporting the claim.
 Only use facts that appear in the sources. Note where sources disagree or look out of date.
 If the sources do not answer the question, say so. Today's date is {{today}}.
 {UNTRUSTED_RULE}"""
@@ -48,7 +52,9 @@ If the notes are well supported, say so briefly. Do not add new facts. Today's d
 
 WRITER_PROMPT = f"""You are the answer writer of a read-only research workflow.
 Write a concise answer to the user's question using only the evidence notes (and reviewer comments, if any).
-Cite sources inline as (Title, URL, date). Cite only sources listed under "Sources fetched" or "Search results".
+Cite sources inline as (Title, URL, date, "quote"), copying the quote exactly from the evidence note you rely on.
+Never shorten, paraphrase or invent a quote: the app checks each quote against the cited page. If a note has no quote, cite without one.
+Cite only sources listed under "Sources fetched" or "Search results".
 Leave out or clearly qualify claims the reviewer flagged. Say plainly when the evidence is insufficient or sources disagree.
 Do not claim to have done anything other than search and read public web pages. Today's date is {{today}}.
 {UNTRUSTED_RULE}"""
@@ -155,6 +161,7 @@ class ResearchResult:
     usage: dict
     stopped: str | None = None
     cancelled: bool = False
+    citations: list[dict[str, str]] | None = None  # set only when the writer produced an answer
 
 
 def _clip(text: str, limit: int) -> str:
@@ -207,6 +214,7 @@ def run_research(
     trace: list[dict[str, str]] = []
     pages_read: list[dict[str, str]] = []
     search_hits: list[dict[str, str]] = []
+    fetched_by_url: dict[str, str] = {}  # requested and final URL -> page text, for the citation check
     stopped: str | None = None
     cancelled = False
     per_call = limits.max_input_chars
@@ -238,9 +246,14 @@ def run_research(
         trace.append({"name": f"{step} · {model.name}", "arguments": f"{len(prompt):,} chars in", "result": result.text + note})
         return result.text
 
-    def finish(answer: str) -> ResearchResult:
+    def finish(answer: str, citations: list[dict[str, str]] | None = None) -> ResearchResult:
         return ResearchResult(
-            answer + format_sources(pages_read, search_hits), trace, budget.usage.as_dict(), stopped, cancelled
+            answer + format_sources(pages_read, search_hits),
+            trace,
+            budget.usage.as_dict(),
+            stopped,
+            cancelled,
+            citations,
         )
 
     calls_needed = 2 + (1 if review else 0)
@@ -290,6 +303,7 @@ def run_research(
             if meta:
                 pages_read.append(meta)
                 page_texts.append(text)
+                fetched_by_url[hit["url"]] = fetched_by_url[meta["url"]] = text
 
         snippets = "\n\n".join(
             f"[{h['title']} | {h['url']} | {h.get('date') or 'date not stated'}]" for h in search_hits
@@ -325,7 +339,19 @@ def run_research(
             + f"{source_heading}:\n{source_list}"
         )
         answer = call("writer", WRITER_PROMPT.format(today=today), prompt)
-        return finish(answer or "The model returned an empty answer.")
+        if not answer:
+            return finish("The model returned an empty answer.")
+
+        # 7. Citation check: Python only, against text already fetched. No model call or network.
+        citations = check_citations(answer, fetched_by_url)
+        trace.append({
+            "name": "citation_check · Python",
+            "arguments": f"{len(citations)} citation(s), {len(pages_read)} page(s) read",
+            "result": summarize(citations) + "".join(
+                f"\n- {c['status']}: {c['url']}" + (f' "{c["quote"]}"' if c["quote"] else "") for c in citations
+            ),
+        })
+        return finish(answer, citations)
 
     except BudgetExceeded as exc:
         stopped = f"Stopped: {exc}."

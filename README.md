@@ -90,16 +90,34 @@ Invalid values are shown as errors in the sidebar, not silently replaced by anot
 1. **Query planning (only when the call limit leaves room):** if `MAX_MODEL_CALLS_PER_QUESTION` is higher than the calls the workflow needs, the model writes up to `MAX_SEARCHES_PER_QUESTION` search queries. Otherwise your question is used as the search query.
 2. **Search:** Python sends the queries to Tavily (basic search) and stops at the search limit.
 3. **Read pages:** Python picks the top results, preferring different sites, and fetches up to the page limit itself. Tavily's extract and crawl features are never used.
-4. **Researcher (1 model call):** writes short evidence notes with title, URL and date.
+4. **Researcher (1 model call):** writes short evidence notes with title, URL, date and a short exact quote from the source.
 5. **Reviewer (1 model call, optional):** flags unsupported, conflicting, dated or weak claims. It does no extra searching.
-6. **Writer (1 model call):** writes the answer, citing only pages that were actually fetched.
+6. **Writer (1 model call):** writes the answer, citing only pages that were actually fetched, each with the quote from the evidence note.
+7. **Citation check (Python, no model call):** see below.
 
 With the defaults this is 3 model calls with the reviewer on, or 2 with it off (and 3 if the planner fits). The model never gets tools: it only reads the text Python gives it, so it cannot search, browse, or act on anything by itself.
 
 Under each answer the app shows:
 
+- a **citation check**: how many cited quotes were found on the cited pages, with a status for each citation
 - a **workflow trace**: every search, fetch and model step, with its input size and output
 - a **usage line**: model calls, input/output/thinking tokens, Tavily searches, pages fetched, and for Gemini an estimated cost
+
+## Citation check
+
+After the writer finishes, Python looks for each cited quote in the text of the page it cites. It only compares text the app already fetched. It makes no model call, search or web request and costs nothing. Each citation gets one status:
+
+| Status | Meaning |
+|---|---|
+| ✅ Quote found on the page | The quote is on the cited page. Differences in case, punctuation and spacing are ignored. |
+| 🟡 Quote nearly matches | At least 85% of the quote's words appear in order in one passage of the page. Small changes, such as a dropped word, are tolerated. |
+| ⚠️ Quote not found | The app read the page, but the quote is not on it. The model may have paraphrased, changed or invented it. |
+| ❌ Page was not read by the app | The cited URL is not one of the fetched pages. It may be a search result that was not opened, or a made-up link. |
+| ➖ No quote to check | The citation has no quote, or the quote is shorter than 4 words. |
+
+**What it does not do:** a found quote shows that the text is on the page. It does **not** show that the quote supports the claim it is attached to, that the page is right, or that the page is current. Small local models sometimes paraphrase instead of quoting, so some "not found" results are paraphrases rather than invented facts. Check important claims against the sources yourself.
+
+The check runs only when the writer produced an answer. It does not run for cancelled or stopped questions, or in Local documents mode.
 
 ## Cancelling a question
 

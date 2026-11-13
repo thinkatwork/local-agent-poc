@@ -9,6 +9,7 @@ from urllib.request import urlopen
 
 import streamlit as st
 
+from agent.citations import STATUS_LABELS, summarize
 from agent.config import load_settings, redact, secrets
 from agent.core import run_agent
 from agent.jobs import BackgroundJob, Cancelled, start_job
@@ -45,6 +46,20 @@ def show_trace(trace: list[dict[str, str]]) -> None:
         for step in trace:
             st.markdown(f"**{step['name']}** · `{redact(step['arguments'], SECRETS)}`")
             st.code(redact(step["result"], SECRETS)[:2500], language="text")
+
+
+def show_citations(citations: list[dict[str, str]]) -> None:
+    with st.expander(summarize(citations)):
+        st.caption(
+            "The app looked for each quoted passage in the text of the page it cites. This is a text match only: "
+            "a found quote is on the page, but may still not support the claim. Check important claims yourself."
+        )
+        for citation in citations:
+            quote = redact(citation["quote"], SECRETS)
+            url = redact(citation["url"], SECRETS).replace("`", "%60")  # keep untrusted text inside the code span
+            st.markdown(f"{STATUS_LABELS[citation['status']]} · `{url}`")
+            if quote:
+                st.text(f'"{quote}"')
 
 
 def show_usage(usage: dict, provider: str) -> None:
@@ -167,6 +182,8 @@ for key in ("api_messages", "display_messages", "research_history"):
 for item in st.session_state.display_messages:
     with st.chat_message(item["role"]):
         st.markdown(item["content"])
+        if item.get("citations") is not None:
+            show_citations(item["citations"])
         if item.get("tools"):
             show_trace(item["tools"])
         if item.get("usage"):
@@ -289,7 +306,14 @@ def finish_active(item: dict) -> None:
         if not result.cancelled:
             st.session_state.research_history.append({"question": question, "answer": answer})
         messages.append(
-            {"role": "assistant", "content": answer, "tools": result.trace, "usage": result.usage, "provider": question_provider}
+            {
+                "role": "assistant",
+                "content": answer,
+                "citations": result.citations,
+                "tools": result.trace,
+                "usage": result.usage,
+                "provider": question_provider,
+            }
         )
     st.session_state.active = None
 
