@@ -101,6 +101,22 @@ Under each answer the app shows:
 - a **workflow trace**: every search, fetch and model step, with its input size and output
 - a **usage line**: model calls, input/output/thinking tokens, Tavily searches, pages fetched, and for Gemini an estimated cost
 
+## Cancelling a question
+
+While a question is running, the assistant's reply shows the current step (for example "Reading page 2/4") and a **Cancel** button. The chat box is disabled until the question finishes or is cancelled.
+
+When you press **Cancel**:
+
+- No new web search, page fetch, model call or document tool call is started. The workflow checks before each one.
+- **Ollama, Web research:** the reply in progress is streamed, so generation stops within a moment and the connection to Ollama is closed.
+- **Ollama, Local documents:** a model reply already in progress is not interrupted. It may finish in the background on your Mac, and its result is discarded.
+- **Gemini:** a request that is already in progress cannot be recalled. It may still finish at Google and **be billed**, and its result is discarded. Cancelling stops any further calls.
+- A Tavily search or page fetch already in progress finishes (pages have a 10-second timeout), then the question stops.
+- If the workflow stops within a few seconds, the reply shows what was done so far: the workflow trace, the usage line, and any researcher notes, marked as cancelled and not reviewed. Otherwise the app moves on and discards the late result.
+- A cancelled web question is not used as context for your next question.
+
+**Clear conversation** also cancels a running question.
+
 ## Hard limits enforced in code
 
 These are enforced in Python, not just requested in prompts:
@@ -204,6 +220,7 @@ They cover:
 - that local document text never reaches the research model
 - the Gemini request settings (`store=false`, no continuation, output cap)
 - that API keys never appear in errors
+- cancelling: no calls after a cancel, Ollama streams closed mid-reply, and the background job handling
 
 ## Suggested first evaluation
 
